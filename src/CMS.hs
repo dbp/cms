@@ -1,7 +1,6 @@
 {-# LANGUAGE OverloadedStrings, EmptyDataDecls, ExistentialQuantification, TemplateHaskell, MultiParamTypeClasses,
              DeriveDataTypeable, PackageImports, TypeFamilies #-}
 
-
 import System.Random
 import Data.Map (Map)
 import qualified Data.Map as M
@@ -26,64 +25,67 @@ import Data.SafeCopy
 import Data.Typeable
 import Snap.Http.Server.Config
 
-data Blob = Blob { unBlob :: (Text, Text) } deriving (Typeable)
-$(deriveSafeCopy 0 'base ''Blob)
 
+-- Some State Functions... AcidState used to make it self-contained (but still easy).
+data Blob = Blob { _blobVal :: (Text, Text) } deriving (Typeable)
+makeLenses ''Blob
+$(deriveSafeCopy 0 'base ''Blob)
 data BlobState = BlobState (Map Int Blob) deriving (Typeable)
 $(deriveSafeCopy 0 'base ''BlobState)
-
 insertKey :: Int -> Blob -> Update BlobState ()
 insertKey key value
     = do BlobState m <- get
          put (BlobState (M.insert key value m))
-
 lookupKey :: Int -> Query BlobState (Maybe Blob)
 lookupKey key
     = do BlobState m <- ask
          return (M.lookup key m)
-
 $(makeAcidic ''BlobState ['insertKey, 'lookupKey])
 
+-- Minimal snaplet setup
 data App = App { _acid :: Snaplet (Acid BlobState) }
 makeLenses ''App
 instance HasAcid App BlobState where
   getAcidStore = (view snapletValue) . (view acid)
 type AppHandler = Handler App App
-
-
-h :: AppHandler ()
-h = cmsData "/cms/blobs" cr get empty upd
-  where cr v = do key <- liftIO $ randomRIO (1,999999) -- NOTE(dbp 2014-06-16): For the love of god, do not use this in real applications!
-                  update (InsertKey key v)
-                  return key
-        get key = query (LookupKey key)
-        empty = Blob ("","")
-        upd i v = do update (InsertKey i v)
-                     return ()
-
 app :: SnapletInit App App
 app = makeSnaplet "app" "" Nothing $ do
     addRoutes [("", h)]
     a <- nestSnaplet "acid" acid $ acidInit (BlobState $ M.empty)
     return $ App a
-
 main :: IO ()
 main = serveSnaplet defaultConfig app
 
+-- What we care about: Use of the library to serve a handler, and the instanced needed for data types.
+h :: AppHandler ()
+h = cmsData "/cms/blobs" cr getKey emptyBlob upd
+  where cr v = do key <- liftIO $ randomRIO (1,999999) -- NOTE(dbp 2014-06-16): For the love of god, do not use this in real applications!
+                  update (InsertKey key v)
+                  return key
+        getKey key = query (LookupKey key)
+        emptyBlob = Blob ("","")
+        upd i v = do update (InsertKey i v)
+                     return ()
+
+-- NOTE(dbp 2014-06-24): Lenses make type checking hard... Would need
+-- to add signatures to eliminate the silliness below.
 instance CMS Blob where
-  getFields = [mkField1 Nothing, mkField2 Nothing]
-    where mkField1 v = Field v (mkField1 . Just) (fst.unBlob) update1 id id "fst"
-          update1 t Nothing = t
-          update1 t (Just v) = Blob (v, snd (unBlob t))
-          mkField2 v = Field v (mkField2 . Just) (snd.unBlob) update2 id id "snd"
-          update2 t Nothing = t
-          update2 t (Just v) = Blob (fst (unBlob t), v)
+  getFields = [ mkField (blobVal._1) (blobVal._1) "fst" Nothing
+              , mkField (blobVal._2) (blobVal._2) "snd" Nothing
+              ]
+    where mkField l l2 nm v = Field v (mkField l l2 nm . Just) (view l) (mset l2) id id nm
+          mset _ t Nothing = t
+          mset s t (Just v) = set s v t
 
 -- library Follows
-data Field t = forall v. Field { getVal :: Maybe v, setVal :: v -> Field t, extractVal :: t -> v,
-                                 updateContainer :: t -> Maybe v -> t,
-                                 renderVal :: v -> Text, parseVal :: Text -> v,
-                                 fieldName :: Text }
+data Field t = forall v. Field { getVal :: Maybe v
+                               , setVal :: v -> Field t
+                               , extractVal :: t -> v
+                               , updateContainer :: t -> Maybe v -> t
+                               , renderVal :: v -> Text
+                               , parseVal :: Text -> v
+                               , fieldName :: Text
+                               }
 
 class CMS t where
   getFields :: [Field t]
