@@ -45,7 +45,10 @@ lookupKey key
 lookupAll :: Query BlobState [(Int, Blob)]
 lookupAll = do BlobState m <- ask
                return (M.assocs m)
-$(makeAcidic ''BlobState ['insertKey, 'lookupKey, 'lookupAll])
+deleteKey :: Int -> Blob -> Update BlobState ()
+deleteKey i _ = do BlobState m <- get
+                   put (BlobState (M.delete i m))
+$(makeAcidic ''BlobState ['insertKey, 'lookupKey, 'lookupAll, 'deleteKey])
 
 -- Minimal snaplet setup
 data App = App { _acid :: Snaplet (Acid BlobState) }
@@ -63,15 +66,12 @@ main = serveSnaplet defaultConfig app
 
 -- What we care about: Use of the library to serve a handler, and the instanced needed for data types.
 h :: AppHandler ()
-h = cmsData "/cms/blobs" getAllVals cr getKey emptyBlob upd
+h = cmsData "/cms/blobs" (query LookupAll) cr (query . LookupKey) (Blob ("","")) upd del
   where cr v = do key <- liftIO $ randomRIO (1,999999) -- NOTE(dbp 2014-06-16): For the love of god, do not use this in real applications!
                   update (InsertKey key v)
                   return key
-        getAllVals = query LookupAll
-        getKey key = query (LookupKey key)
-        emptyBlob = Blob ("","")
-        upd i v = do update (InsertKey i v)
-                     return ()
+        upd i v = void $ update (InsertKey i v)
+        del i v = void $ update (DeleteKey i v)
 
 -- NOTE(dbp 2014-06-24): Lenses make type checking hard... Would need
 -- to add signatures to eliminate the silliness below.
@@ -102,20 +102,26 @@ cmsData :: CMS t => ByteString
                  -> (Int -> AppHandler (Maybe t))
                  -> t
                  -> (Int -> t -> AppHandler ())
+                 -> (Int -> t -> AppHandler ())
                  -> AppHandler ()
-cmsData base getAll create get empty update = route [(base, route [("/", ifTop cmsIndex)
-                                                                  ,("/new", cmsNew)
-                                                                  ,("/edit/:id", cmsEdit)
-                                                                  ])]
+cmsData base getAll create get empty update delete = route [(base, route [("/", ifTop cmsIndex)
+                                                                         ,("/new", cmsNew)
+                                                                         ,("/edit/:id", cmsEdit)
+                                                                         ,("/delete/:id", cmsDelete)
+                                                                         ])]
   where cmsIndex = do all <- getAll
                       let fs = getFields
                       let html = do
                             H.p $ do H.a H.! A.href (H.toValue $ T.decodeUtf8 $ base <> "/new") $ "New"
                                      H.br
                             H.table $ do
-                              H.tr $ forM_ fs (H.th . H.toHtml . fieldName)
+                              H.tr $ do
+                                H.th ""
+                                H.th ""
+                                forM_ fs (H.th . H.toHtml . fieldName)
                               forM_ all (\(i,e) -> H.tr $ do
                                 H.td $ H.a H.! A.href (H.toValue $ T.decodeUtf8 $  base <> "/edit/" <> (B8.pack $ show i)) $ "Edit"
+                                H.td $ H.a H.! A.href (H.toValue $ T.decodeUtf8 $  base <> "/delete/" <> (B8.pack $ show i)) H.! A.onclick "return confirm('Are you sure you want to delete this item?')" $ "Delete"
                                 forM_ fs (\(Field _ _ ext _ ren _ _) -> H.td $ H.toHtml $ ren (ext e)))
                       writeLBS (renderHtml html)
         cmsNew = do let fs = getFields
@@ -137,6 +143,13 @@ cmsData base getAll create get empty update = route [(base, route [("/", ifTop c
                                       (view, Nothing) -> writeLBS (renderHtml $ html view)
                                       (_, Just t) -> do update idInt t
                                                         redirect base
+        cmsDelete = do (Just id') <- getParam "id"
+                       let idInt = read $ B8.unpack id'
+                       mi <- get idInt
+                       case mi of
+                         Nothing -> pass
+                         Just t -> do delete idInt t
+                                      redirect base
         buildForm :: CMS t => [Field t] -> Maybe t -> t -> (Form H.Html AppHandler t, View H.Html -> H.Html)
         buildForm fields v emty = let form = build <$> sequenceA (map (\(Field get set extract upd render parse name) ->
                                                                         (\t -> set (parse t)) <$> name .: text (render . extract <$> v)) fields)
