@@ -5,17 +5,19 @@ import System.Random
 import Data.Map (Map)
 import qualified Data.Map as M
 import Data.Maybe
-import Data.Traversable
-import Snap
-import "mtl" Control.Monad.Reader
+import Data.Monoid
+import Data.Traversable hiding (sequence)
+import Snap hiding (forM)
+import "mtl" Control.Monad.Reader hiding (forM)
 import Data.Text (Text)
+import qualified Data.Text.Encoding as T
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as B8
 import qualified Text.Blaze.Html5 as H
 import qualified Text.Blaze.Html5 as H
 import qualified Text.Blaze.Html5.Attributes as A
-import Text.Blaze.Renderer.Utf8
+import Text.Blaze.Html.Renderer.Utf8
 import Text.Digestive
 import Text.Digestive.Snap
 import qualified Text.Digestive.Blaze.Html5 as F
@@ -40,7 +42,10 @@ lookupKey :: Int -> Query BlobState (Maybe Blob)
 lookupKey key
     = do BlobState m <- ask
          return (M.lookup key m)
-$(makeAcidic ''BlobState ['insertKey, 'lookupKey])
+lookupAll :: Query BlobState [(Int, Blob)]
+lookupAll = do BlobState m <- ask
+               return (M.assocs m)
+$(makeAcidic ''BlobState ['insertKey, 'lookupKey, 'lookupAll])
 
 -- Minimal snaplet setup
 data App = App { _acid :: Snaplet (Acid BlobState) }
@@ -58,10 +63,11 @@ main = serveSnaplet defaultConfig app
 
 -- What we care about: Use of the library to serve a handler, and the instanced needed for data types.
 h :: AppHandler ()
-h = cmsData "/cms/blobs" cr getKey emptyBlob upd
+h = cmsData "/cms/blobs" getAllVals cr getKey emptyBlob upd
   where cr v = do key <- liftIO $ randomRIO (1,999999) -- NOTE(dbp 2014-06-16): For the love of god, do not use this in real applications!
                   update (InsertKey key v)
                   return key
+        getAllVals = query LookupAll
         getKey key = query (LookupKey key)
         emptyBlob = Blob ("","")
         upd i v = do update (InsertKey i v)
@@ -91,21 +97,34 @@ class CMS t where
   getFields :: [Field t]
 
 cmsData :: CMS t => ByteString
+                 -> AppHandler [(Int, t)]
                  -> (t -> AppHandler Int)
                  -> (Int -> AppHandler (Maybe t))
                  -> t
                  -> (Int -> t -> AppHandler ())
                  -> AppHandler ()
-cmsData base create get empty update = route [(base, route [("/new", cmsNew)
-                                                           ,("/edit/:id", cmsEdit)
-                                                           ])]
-  where cmsNew = do let fs = getFields
+cmsData base getAll create get empty update = route [(base, route [("/", ifTop cmsIndex)
+                                                                  ,("/new", cmsNew)
+                                                                  ,("/edit/:id", cmsEdit)
+                                                                  ])]
+  where cmsIndex = do all <- getAll
+                      let fs = getFields
+                      let html = do
+                            H.p $ do H.a H.! A.href (H.toValue $ T.decodeUtf8 $ base <> "/new") $ "New"
+                                     H.br
+                            H.table $ do
+                              H.tr $ forM_ fs (H.th . H.toHtml . fieldName)
+                              forM_ all (\(i,e) -> H.tr $ do
+                                H.td $ H.a H.! A.href (H.toValue $ T.decodeUtf8 $  base <> "/edit/" <> (B8.pack $ show i)) $ "Edit"
+                                forM_ fs (\(Field _ _ ext _ ren _ _) -> H.td $ H.toHtml $ ren (ext e)))
+                      writeLBS (renderHtml html)
+        cmsNew = do let fs = getFields
                     let (form, html) = buildForm fs Nothing empty
                     r <- runForm "new" form
                     case r of
                       (view, Nothing) -> writeLBS (renderHtml $ html view)
                       (_, Just t) -> do id' <- create t
-                                        redirect $ B.concat [base, "/edit/", B8.pack (show id')]
+                                        redirect base
         cmsEdit = do (Just id') <- getParam "id"
                      let idInt = read $ B8.unpack id'
                      mi <- get idInt
@@ -117,7 +136,7 @@ cmsData base create get empty update = route [(base, route [("/new", cmsNew)
                                     case r of
                                       (view, Nothing) -> writeLBS (renderHtml $ html view)
                                       (_, Just t) -> do update idInt t
-                                                        redirect $ B.concat [base, "/edit/", B8.pack (show idInt)]
+                                                        redirect base
         buildForm :: CMS t => [Field t] -> Maybe t -> t -> (Form H.Html AppHandler t, View H.Html -> H.Html)
         buildForm fields v emty = let form = build <$> sequenceA (map (\(Field get set extract upd render parse name) ->
                                                                         (\t -> set (parse t)) <$> name .: text (render . extract <$> v)) fields)
